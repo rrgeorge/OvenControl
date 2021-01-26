@@ -1,5 +1,4 @@
 #include <ArduinoJson.h>
-
 #include <LiquidCrystal_I2C.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -21,8 +20,13 @@ const char* hostName = "oven";
 
 // Only read temperature ever 10 secs
 const int window = 10000;
+// Allowed deviation in cycles
+const int deviation = 10;
 //Adjust temperature by 45°
-const int adj = -40;
+const int adj = 0;
+//Initial Burnout & ignition times in ms
+const int initial_brnout = 10000;
+const int initial_ign = 42000;
 
 int rotation;
 int value;
@@ -36,7 +40,13 @@ struct Oven {
   boolean preheating = false;
   double target = 0;
   double current = 0;
+  double heatrate = 0;
+  double lossrate = 0;
+  int ignition = initial_ign;
+  int burnout = initial_brnout;
   unsigned long lastread = 0;
+  unsigned long ign_time = 0;
+  unsigned long brn_time = 0;
 } oven;
 
 uint8_t DegreeBitmap[]= { 0x6, 0x9, 0x9, 0x6, 0x0, 0, 0, 0 };
@@ -85,7 +95,7 @@ void setup() {
   server.on("/status", []() {
     char json[200];
     DynamicJsonDocument doc(192);
-    oven.current = readThermocoupleF() + adj;
+    oven.current = getAdjustedTemp();
     doc["on"] = oven.on;
     doc["heating"] = oven.heating;
     doc["preheating"] = oven.preheating;
@@ -107,14 +117,16 @@ void setup() {
     } else {
       oven.on = doc["on"];
       oven.target = doc["target"];
-
+      if (oven.target == 0) {
+        oven.target = 200; 
+      }
       if (oven.on) {
         lcd.clear();
         lcd.backlight();
         lcd.setCursor(0,0);
-        lcd.print("Remotely activated");
+        lcd.print("RemoteActivation");
         delay(500);
-        oven.current = readThermocoupleF() + adj;
+        oven.current = getAdjustedTemp();
         lcd.setCursor(0,0);
         lcd.print("                ");
         lcd.setCursor(0,0);
@@ -161,20 +173,36 @@ void loop() {
   unsigned long now = millis();
   if (oven.on) {
     if (now - oven.lastread > window) {
+      double currentTemp = getAdjustedTemp();
+      double changerate = (currentTemp - oven.current)/(now - oven.lastread);
+      if (changerate > 0) {
+        oven.heatrate = changerate;
+      } else {
+        oven.lossrate = changerate;
+      }
+      if (oven.heating && oven.ign_time > 0 && changerate > 0) {
+        oven.ignition = now - oven.ign_time;
+        oven.ign_time = 0;
+      }
+      if (!oven.heating && oven.brn_time > 0 && changerate < 0) {
+        oven.burnout = now - oven.brn_time;
+        oven.brn_time = 0;
+      }
       oven.lastread = now;
-      double currentTemp = readThermocoupleF() + adj;
-      if (currentTemp < oven.target - 15) {
+      if ((oven.lossrate*oven.ignition) + currentTemp < oven.target - deviation) {
         if (!oven.heating) {
           lcd.setCursor(15,0);
           lcd.print("\002");
+          oven.ign_time = now;
           digitalWrite(D0, HIGH);
         }
         oven.heating = true;
-      } else if (currentTemp > oven.target - 5)  {
+      } else if ((oven.heatrate*oven.burnout) + currentTemp > oven.target + deviation)  {
         if (oven.heating) {
           lcd.setCursor(15,0);
           lcd.print(" ");
           oven.heating = false;
+          oven.brn_time = now;
           digitalWrite(D0, LOW);
         }
       }
@@ -231,7 +259,7 @@ void loop() {
      } else { //Counterclockwise
        LeftRight = false;
        RotPosition--;
-       if (oven.on && oven.target > 10 && (RotPosition % 2) == 0 ) {
+       if (oven.on && oven.target > 80 && (RotPosition % 2) == 0 ) {
           oven.target -= 5;
           oven.preheating = true;
           lcd.setCursor(0,0);
@@ -273,7 +301,7 @@ void loop() {
           oven.on = true;
           oven.target = 200;
           delay(500);
-          oven.current = readThermocoupleF() + adj;
+          oven.current = getAdjustedTemp();
           lcd.setCursor(0,0);
           lcd.print("                ");
           lcd.setCursor(0,0);
@@ -291,6 +319,18 @@ void loop() {
          }
        }
    }
+}
+
+
+double getAdjustedTemp() {
+  double temp = readThermocoupleF();
+
+  if (temp <= 100) {
+    return temp;
+  } else {
+    // Adjust tempertature based on readings at 350°
+    return temp+(adj*((temp-100)/250));
+  }
 }
 
 double readThermocoupleF() {
